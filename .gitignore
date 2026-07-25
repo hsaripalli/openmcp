@@ -23,3 +23,7 @@ catalog.duckdb.tmp
 .idea/
 .codex/
 .mcp.json
+
+# Frontend project / build artifacts
+frontend/
+

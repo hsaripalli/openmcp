@@ -44,7 +44,11 @@ except ImportError:
 
 from semantic.embed import embed_texts
 from semantic.store import top_k, DB_PATH, get_by_ids
-from telemetry import log_telemetry, is_telemetry_disabled
+from telemetry import (
+    is_telemetry_disabled,
+    log_telemetry,
+    register_dataset_resources,
+)
 
 mcp = FastMCP("OpenMCP Canada — open.canada.ca")
 
@@ -399,10 +403,10 @@ def semantic_search_datasets(query: str, limit: int = 10) -> str:
             
     # Crop to the requested limit
     fused_results = fused_results[:limit]
-    
+
     if not fused_results:
         return f"No queryable tabular datasets found matching: '{query}'"
-        
+
     md = [f"### Hybrid Search Results (RRF) for '{query}' (showing top {len(fused_results)})\n"]
     for ds in fused_results:
         title = ds["title"]
@@ -519,6 +523,7 @@ def get_dataset(dataset_id: str) -> str:
     md = [f"## [{title}]({page})", f"**Publisher**: {org}",
           f"**Source**: {page}", f"**Description**: {desc}", ""]
     resources = ds.get("resources", [])
+    register_dataset_resources(ds_id, resources)
     md.append(f"### Resources ({len(resources)})\n")
 
     rows = []

@@ -5,10 +5,11 @@ Sends high-level, anonymous usage events to a database endpoint (e.g., Supabase,
 PostgREST, Firebase, or a custom HTTP collector) in a non-blocking background thread.
 
 Privacy Guarantee:
-    - NO Personal Identifiable Information (PII)
-    - NO IP addresses or user identifiers
-    - NO local file contents or system paths
-    - ONLY tool names, query keywords, dataset IDs, execution latency, and success status.
+    - NO raw questions, search queries, SQL, filters, or complete URLs
+    - NO full error messages, local file paths, or resource contents
+    - ONLY a temporary session ID, tool name, success/failure status,
+      normalized error code, latency, server version, and a unique list of
+      public dataset IDs when available.
 
 Opt-Out:
     Set environment variable `OPENMCP_TELEMETRY_DISABLED=true` or `DISABLE_TELEMETRY=1`.
@@ -21,6 +22,8 @@ import uuid
 import logging
 import functools
 import concurrent.futures
+import hashlib
+import threading
 from typing import Any, Callable, Dict, Optional
 import re
 import inspect
@@ -41,9 +44,12 @@ DEFAULT_TELEMETRY_KEY = (
 
 # Generate a single random session ID per server process run (non-identifiable)
 SESSION_ID = str(uuid.uuid4())
+SERVER_VERSION = "1.0.0"
 
 # Background thread pool worker (max 2 threads, fast daemon)
 _executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="TelemetryWorker")
+_resource_dataset_map: Dict[str, str] = {}
+_resource_dataset_lock = threading.Lock()
 
 
 def is_telemetry_disabled() -> bool:
@@ -73,12 +79,10 @@ def _post_event_task(endpoint_url: str, api_key: Optional[str], payload: Dict[st
 
 def record_telemetry_event(
     tool_name: str,
-    question_or_query: Optional[str] = None,
-    dataset_id: Optional[str] = None,
-    resource_id: Optional[str] = None,
+    dataset_ids: Optional[list[Any]] = None,
     latency_ms: Optional[float] = None,
     status: str = "success",
-    error_message: Optional[str] = None
+    error_code: Optional[str] = None,
 ) -> None:
     """
     Queue an anonymous telemetry event to be posted in a background thread.
@@ -93,12 +97,11 @@ def record_telemetry_event(
     payload = {
         "session_id": SESSION_ID,
         "tool_name": tool_name,
-        "question_or_query": str(question_or_query)[:500] if question_or_query else None,
-        "dataset_id": str(dataset_id)[:100] if dataset_id else None,
-        "resource_id": str(resource_id)[:100] if resource_id else None,
+        "status": "error" if status == "error" else "success",
+        "error_code": str(error_code)[:100] if error_code else None,
         "latency_ms": round(latency_ms, 2) if latency_ms is not None else None,
-        "status": status,
-        "error_message": str(error_message)[:300] if error_message else None,
+        "server_version": SERVER_VERSION,
+        "dataset_ids": _normalize_dataset_ids(dataset_ids or []),
     }
 
     # Dispatch to background thread pool (non-blocking)
@@ -108,8 +111,89 @@ def record_telemetry_event(
         logger.debug(f"Could not submit telemetry task: {e}")
 
 
-def _extract_telemetry_args(func: Callable, args: tuple, kwargs: dict) -> Dict[str, Optional[str]]:
-    """Extract question/query, dataset_id, and resource_id from wrapped function call."""
+def _normalize_dataset_id(value: Any) -> Optional[str]:
+    """Return a safe public dataset identifier, never a complete URL."""
+    if value is None:
+        return None
+    text = str(value)
+    url_match = re.search(r"/dataset/([0-9a-z_-]{1,100})", text, re.IGNORECASE)
+    if url_match:
+        return url_match.group(1)
+    if re.fullmatch(r"[0-9a-z_-]{1,100}", text, re.IGNORECASE):
+        return text
+    return None
+
+
+def _normalize_dataset_ids(values: list[Any]) -> list[str]:
+    """Return at most 25 unique, safe public dataset identifiers."""
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        dataset_id = _normalize_dataset_id(value)
+        if not dataset_id or dataset_id in seen:
+            continue
+        seen.add(dataset_id)
+        normalized.append(dataset_id)
+        if len(normalized) == 25:
+            break
+    return normalized
+
+
+def _dataset_ids_from_result(result: Any) -> list[str]:
+    """Extract public dataset IDs from a tool result without retaining its text."""
+    if not isinstance(result, str):
+        return []
+    return _normalize_dataset_ids(
+        re.findall(r"/dataset/([0-9a-z_-]{1,100})", result, re.IGNORECASE)
+    )
+
+
+def _resource_key(value: Any) -> Optional[str]:
+    """Create an in-memory lookup key without retaining a resource ID or URL."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def register_dataset_resources(dataset_id: Any, resources: list[dict]) -> None:
+    """Associate resource IDs and URLs with a public dataset for this process run."""
+    normalized_dataset_id = _normalize_dataset_id(dataset_id)
+    if not normalized_dataset_id:
+        return
+
+    associations: Dict[str, str] = {}
+    for resource in resources:
+        for field in ("id", "url"):
+            key = _resource_key(resource.get(field))
+            if key:
+                associations[key] = normalized_dataset_id
+
+    if associations:
+        with _resource_dataset_lock:
+            _resource_dataset_map.update(associations)
+
+
+def _dataset_id_for_resource(value: Any) -> Optional[str]:
+    """Resolve a resource locally without transmitting its ID or complete URL."""
+    key = _resource_key(value)
+    if key:
+        with _resource_dataset_lock:
+            dataset_id = _resource_dataset_map.get(key)
+        if dataset_id:
+            return dataset_id
+
+    if isinstance(value, str):
+        match = re.search(r"/dataset/([0-9a-z_-]{1,100})", value, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _extract_dataset_id(func: Callable, args: tuple, kwargs: dict) -> Optional[str]:
+    """Extract only a public dataset identifier from a wrapped tool call."""
     bound_map: Dict[str, Any] = {}
     try:
         sig = inspect.signature(func)
@@ -121,29 +205,15 @@ def _extract_telemetry_args(func: Callable, args: tuple, kwargs: dict) -> Dict[s
         if args and isinstance(args[0], str):
             bound_map["_arg0"] = args[0]
 
-    question_or_query = (
-        bound_map.get("sql_query") or
-        bound_map.get("query") or
-        bound_map.get("q") or
-        bound_map.get("filters") or
-        bound_map.get("question") or
-        bound_map.get("topic") or
-        bound_map.get("_arg0")
-    )
     dataset_id = bound_map.get("dataset_id") or bound_map.get("id")
-    resource_id = bound_map.get("resource_id") or bound_map.get("file_url") or bound_map.get("url")
+    if dataset_id:
+        return _normalize_dataset_id(dataset_id)
 
-    # If dataset_id is missing, attempt to extract dataset ID/slug from resource_id/file_url if it's a URL
-    if not dataset_id and resource_id and isinstance(resource_id, str):
-        m = re.search(r"/dataset/([0-9a-f-]{36}|[\w-]+)", resource_id)
-        if m:
-            dataset_id = m.group(1)
-
-    return {
-        "question_or_query": str(question_or_query) if question_or_query is not None else None,
-        "dataset_id": str(dataset_id) if dataset_id is not None else None,
-        "resource_id": str(resource_id) if resource_id is not None else None,
-    }
+    for key in ("resource_id", "file_url", "url", "_arg0"):
+        resolved_dataset_id = _dataset_id_for_resource(bound_map.get(key))
+        if resolved_dataset_id:
+            return resolved_dataset_id
+    return None
 
 
 def log_telemetry(tool_name: str) -> Callable:
@@ -154,31 +224,37 @@ def log_telemetry(tool_name: str) -> Callable:
         @functools.wraps(func)
         def wrapper(*args, **kwargs) -> Any:
             start_time = time.perf_counter()
-            error_msg = None
+            error_code = None
             status = "success"
-
-            extracted = _extract_telemetry_args(func, args, kwargs)
-            question_or_query = extracted["question_or_query"]
-            dataset_id = extracted["dataset_id"]
-            resource_id = extracted["resource_id"]
+            input_dataset_id = _extract_dataset_id(func, args, kwargs)
+            dataset_ids = [input_dataset_id] if input_dataset_id else []
 
             try:
                 result = func(*args, **kwargs)
+                dataset_ids = _normalize_dataset_ids(
+                    dataset_ids + _dataset_ids_from_result(result)
+                )
+                if isinstance(result, str):
+                    normalized_result = result.lstrip()
+                    if normalized_result.startswith("Error"):
+                        status = "error"
+                        error_code = "ToolReturnedError"
+                    elif normalized_result.startswith("Query timed out"):
+                        status = "error"
+                        error_code = "TimeoutError"
                 return result
             except Exception as ex:
                 status = "error"
-                error_msg = str(ex)
+                error_code = type(ex).__name__
                 raise ex
             finally:
                 elapsed_ms = (time.perf_counter() - start_time) * 1000.0
                 record_telemetry_event(
                     tool_name=tool_name,
-                    question_or_query=question_or_query,
-                    dataset_id=dataset_id,
-                    resource_id=resource_id,
+                    dataset_ids=dataset_ids,
                     latency_ms=elapsed_ms,
                     status=status,
-                    error_message=error_msg
+                    error_code=error_code,
                 )
 
         return wrapper

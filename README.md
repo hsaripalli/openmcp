@@ -1,10 +1,13 @@
-# OpenMCP Canada — Discover and query 25,000+ Canadian government datasets
+# opendata.fyi — Explore public data with your AI assistant
 
-An MCP server that lets any AI assistant or MCP client (Claude, Cursor, Codex, ChatGPT, Gemini CLI, Zed, etc.) discover and query the
-Government of Canada Open Data portal ([open.canada.ca](https://open.canada.ca))
-in plain English.
+An open-source MCP server that lets AI assistants and MCP clients (Claude,
+Cursor, Codex, ChatGPT, Gemini CLI, Zed, and others) discover and query public
+datasets published through [open.canada.ca](https://open.canada.ca), with more
+sources coming soon.
 
-Ask *"how do interest rates affect housing prices?"* and your AI assistant semantically searches the indexed datasets, queries the relevant resources, and answers with source dataset links — no manual downloads or hunting through the portal required.
+Ask *"how do interest rates affect housing prices?"* and your AI assistant can
+use opendata.fyi to find relevant datasets, query their resources, and answer
+with source links—without manual downloads or hunting through the portal.
 
 **Zero API keys required.** Semantic search runs on a local embedding model (bge-small-en-v1.5 via [fastembed](https://github.com/qdrant/fastembed)); data querying is powered by CKAN's public API and DuckDB.
 
@@ -32,7 +35,7 @@ Every response includes a source link back to open.canada.ca.
 ## Quick start
 
 ```bash
-git clone https://github.com/hsaripalli/openmcp.git
+git clone https://github.com/opendatafyi/openmcp.git
 cd openmcp
 python3 -m venv venv
 venv/bin/pip install -r requirements.txt
@@ -41,11 +44,11 @@ venv/bin/pip install -r requirements.txt
 ### Get the search index
 
 The semantic index (`catalog.duckdb`, ~120MB) is too large for git. Download it
-from the [latest release](https://github.com/hsaripalli/openmcp/releases) and put it in the project root.
+from the [latest release](https://github.com/opendatafyi/openmcp/releases) and put it in the project root.
 
 ### Client Setup (Universal MCP Standard)
 
-OpenMCP uses the standard **MCP stdio protocol**, making it compatible out of the box with any MCP client application (**Claude Desktop**, **Claude Code**, **Gemini CLI**, **ChatGPT Desktop**, **Cursor**, **Cline / Roo Code**, **Windsurf**, **Zed**, **Continue.dev**, **Goose**, etc.).
+opendata.fyi uses the standard **MCP stdio protocol**, making it compatible out of the box with any MCP client application (**Claude Desktop**, **Claude Code**, **Gemini CLI**, **ChatGPT Desktop**, **Cursor**, **Cline / Roo Code**, **Windsurf**, **Zed**, **Continue.dev**, **Goose**, etc.).
 
 Add this standard JSON block to your client's MCP configuration file (e.g. `claude_desktop_config.json`, `.mcp.json`, `cline_mcp_settings.json`, `mcp_config.json`):
 
@@ -53,8 +56,8 @@ Add this standard JSON block to your client's MCP configuration file (e.g. `clau
 {
   "mcpServers": {
     "openmcp": {
-      "command": "/absolute/path/to/openMCP/venv/bin/python",
-      "args": ["/absolute/path/to/openMCP/mcp_server.py"]
+      "command": "/absolute/path/to/openmcp/venv/bin/python",
+      "args": ["/absolute/path/to/openmcp/mcp_server.py"]
     }
   }
 }
@@ -114,12 +117,20 @@ Plus three MCP prompts (`query_canada_data`, `explore_dataset`,
 
 ## Observability & Anonymous Telemetry
 
-OpenMCP includes lightweight, non-blocking usage telemetry to help maintainers monitor server activity (e.g., search keywords, tool calls, dataset usage, latency, and error rates).
+The opendata.fyi MCP server includes lightweight, non-blocking usage telemetry
+to help maintainers understand tool reliability, performance, and which public
+datasets are surfaced, inspected, and queried.
 
 ### Privacy & Anonymity
-- **NO PII**: Never collects personal data, IP addresses, usernames, or auth keys.
-- **NO Local Data**: Does not access or send local file contents or system paths.
-- **Non-Blocking**: Events dispatch asynchronously in a background thread with zero impact on tool execution or response times.
+- **Collected:** a temporary session ID, tool name, success/failure status,
+  normalized error code, latency, server version, and an ordered list of unique
+  public dataset IDs when datasets appear in search results, are opened, or are
+  queried. Each tool call produces one telemetry row.
+- **Not collected:** raw questions or search queries, SQL, filters, complete
+  URLs, full error messages, file paths, or resource contents.
+- **Anonymous discovery funnel:** the session ID groups dataset-result,
+  inspection, and query events from one server run without identifying a user.
+- **Non-blocking:** events dispatch asynchronously in a background thread.
 
 ### Opting Out / Disabling Telemetry
 Telemetry is active by default. You can completely turn it off at any time using any of these methods:
@@ -131,8 +142,8 @@ Add `"env": { "OPENMCP_TELEMETRY_DISABLED": "true" }` to your MCP configuration 
 {
   "mcpServers": {
     "openmcp": {
-      "command": "/absolute/path/to/openMCP/venv/bin/python",
-      "args": ["/absolute/path/to/openMCP/mcp_server.py"],
+      "command": "/absolute/path/to/openmcp/venv/bin/python",
+      "args": ["/absolute/path/to/openmcp/mcp_server.py"],
       "env": {
         "OPENMCP_TELEMETRY_DISABLED": "true"
       }
