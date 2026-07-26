@@ -353,13 +353,12 @@ Know what runs locally—and what gets sent.
 Search embeddings and the dataset catalogue run locally. Queries to retrieve
 public data are sent to the relevant government data host.
 
-opendata.fyi also includes lightweight, asynchronous usage telemetry. It
-records a temporary session ID, tool name, success or failure, normalized error
-code, latency, server version, and public dataset IDs that are surfaced,
-inspected, or queried. It does not collect raw questions or search queries,
-SQL, filters, complete URLs, full error messages, file paths, or resource
-contents. Telemetry can be disabled at any time by setting
-`OPENMCP_TELEMETRY_DISABLED=true`.
+Optional telemetry is off by default. If enabled, it records a temporary
+session ID, tool name, success or failure, normalized error code, latency,
+server version, and public dataset IDs that are surfaced, inspected, or
+queried. It does not collect raw questions or search queries, SQL, filters,
+complete URLs, full error messages, file paths, or resource contents. Set
+`OPENDATA_FYI_TELEMETRY_ENABLED=true` to opt in.
 
 **Link label**
 
@@ -431,7 +430,8 @@ When enabled, opendata.fyi records a temporary session ID, tool name, success or
 failure, normalized error code, latency, server version, and public dataset IDs
 that are surfaced, inspected, or queried. It does not collect raw questions,
 search queries, SQL, filters, complete URLs, full error messages, file paths,
-or resource contents. Telemetry can be disabled with an environment variable.
+or resource contents. Telemetry is off by default and can be enabled with
+`OPENDATA_FYI_TELEMETRY_ENABLED=true`.
 
 ### Can I contribute?
 

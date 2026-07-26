@@ -115,11 +115,11 @@ Plus three MCP prompts (`query_canada_data`, `explore_dataset`,
 - `datastore_search_sql` is disabled on open.canada.ca, so server-side querying
   uses `q`/`filters`/`sort` rather than raw SQL.
 
-## Observability & Anonymous Telemetry
+## Optional Anonymous Telemetry
 
-The opendata.fyi MCP server includes lightweight, non-blocking usage telemetry
-to help maintainers understand tool reliability, performance, and which public
-datasets are surfaced, inspected, and queried.
+Telemetry is off by default. Users can explicitly enable lightweight,
+non-blocking usage telemetry to help maintainers understand tool reliability,
+performance, and which public datasets are surfaced, inspected, and queried.
 
 ### Privacy & Anonymity
 - **Collected:** a temporary session ID, tool name, success/failure status,
@@ -132,11 +132,11 @@ datasets are surfaced, inspected, and queried.
   inspection, and query events from one server run without identifying a user.
 - **Non-blocking:** events dispatch asynchronously in a background thread.
 
-### Opting Out / Disabling Telemetry
-Telemetry is active by default. You can completely turn it off at any time using any of these methods:
+### Enabling Telemetry
+Telemetry runs only after you explicitly opt in using one of these methods:
 
 #### Method 1: Via MCP Client Configuration (Recommended)
-Add `"env": { "OPENMCP_TELEMETRY_DISABLED": "true" }` to your MCP configuration file (`claude_desktop_config.json` or `.mcp.json`):
+Add `"env": { "OPENDATA_FYI_TELEMETRY_ENABLED": "true" }` to your MCP configuration file (`claude_desktop_config.json` or `.mcp.json`):
 
 ```json
 {
@@ -145,7 +145,7 @@ Add `"env": { "OPENMCP_TELEMETRY_DISABLED": "true" }` to your MCP configuration 
       "command": "/absolute/path/to/openmcp/venv/bin/python",
       "args": ["/absolute/path/to/openmcp/mcp_server.py"],
       "env": {
-        "OPENMCP_TELEMETRY_DISABLED": "true"
+        "OPENDATA_FYI_TELEMETRY_ENABLED": "true"
       }
     }
   }
@@ -156,13 +156,16 @@ Add `"env": { "OPENMCP_TELEMETRY_DISABLED": "true" }` to your MCP configuration 
 Create a `.env` file in the project root (or copy `.env.example`) and set:
 
 ```env
-OPENMCP_TELEMETRY_DISABLED=true
+OPENDATA_FYI_TELEMETRY_ENABLED=true
 ```
 
 #### Method 3: Via Environment Variable
 ```bash
-export OPENMCP_TELEMETRY_DISABLED=true
+export OPENDATA_FYI_TELEMETRY_ENABLED=true
 ```
+
+The existing `OPENMCP_TELEMETRY_DISABLED=true` and `DISABLE_TELEMETRY=1`
+settings remain supported as explicit disable overrides.
 
 ## License
 

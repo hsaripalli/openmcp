@@ -20,24 +20,31 @@ class TestTelemetry(unittest.TestCase):
 
     def setUp(self):
         # Clear telemetry env vars before each test
-        for var in ("OPENMCP_TELEMETRY_DISABLED", "DISABLE_TELEMETRY", "TELEMETRY_DB_URL", "TELEMETRY_DB_KEY"):
+        for var in (
+            "OPENDATA_FYI_TELEMETRY_ENABLED",
+            "OPENMCP_TELEMETRY_ENABLED",
+            "OPENMCP_TELEMETRY_DISABLED",
+            "DISABLE_TELEMETRY",
+            "TELEMETRY_DB_URL",
+            "TELEMETRY_DB_KEY",
+        ):
             if var in os.environ:
                 del os.environ[var]
 
-    def test_opt_out_check(self):
+    def test_opt_in_check(self):
+        self.assertTrue(is_telemetry_disabled())
+
+        os.environ["OPENDATA_FYI_TELEMETRY_ENABLED"] = "true"
         self.assertFalse(is_telemetry_disabled())
 
         os.environ["OPENMCP_TELEMETRY_DISABLED"] = "true"
-        self.assertTrue(is_telemetry_disabled())
-
-        os.environ["OPENMCP_TELEMETRY_DISABLED"] = "false"
-        os.environ["DISABLE_TELEMETRY"] = "1"
         self.assertTrue(is_telemetry_disabled())
 
     @patch("telemetry._executor.submit")
     def test_record_event_when_enabled(self, mock_submit):
         os.environ["TELEMETRY_DB_URL"] = "https://example.supabase.co/rest/v1/telemetry_events"
         os.environ["TELEMETRY_DB_KEY"] = "test-key"
+        os.environ["OPENDATA_FYI_TELEMETRY_ENABLED"] = "true"
 
         record_telemetry_event(
             tool_name="semantic_search_datasets",
@@ -78,7 +85,6 @@ class TestTelemetry(unittest.TestCase):
     @patch("telemetry._executor.submit")
     def test_record_event_when_disabled(self, mock_submit):
         os.environ["TELEMETRY_DB_URL"] = "https://example.supabase.co/rest/v1/telemetry_events"
-        os.environ["OPENMCP_TELEMETRY_DISABLED"] = "true"
 
         record_telemetry_event(
             tool_name="semantic_search_datasets",

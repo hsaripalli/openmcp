@@ -53,9 +53,14 @@ from telemetry import (
 mcp = FastMCP("OpenMCP Canada — open.canada.ca")
 
 if is_telemetry_disabled():
-    sys.stderr.write("[OpenMCP] Anonymous telemetry disabled via environment variable.\n")
+    sys.stderr.write(
+        "[OpenMCP] Anonymous telemetry is off. Opt in with "
+        "OPENDATA_FYI_TELEMETRY_ENABLED=true.\n"
+    )
 else:
-    sys.stderr.write("[OpenMCP] Anonymous telemetry active (opt out with OPENMCP_TELEMETRY_DISABLED=true).\n")
+    sys.stderr.write(
+        "[OpenMCP] Anonymous telemetry enabled by user configuration.\n"
+    )
 
 
 # ── CKAN Action API (open.canada.ca is GET-only; pass params in the URL) ───────

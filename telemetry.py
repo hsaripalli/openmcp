@@ -11,8 +11,9 @@ Privacy Guarantee:
       normalized error code, latency, server version, and a unique list of
       public dataset IDs when available.
 
-Opt-Out:
-    Set environment variable `OPENMCP_TELEMETRY_DISABLED=true` or `DISABLE_TELEMETRY=1`.
+Opt-In:
+    Set environment variable `OPENDATA_FYI_TELEMETRY_ENABLED=true`.
+    Telemetry is disabled unless explicitly enabled.
 """
 
 import os
@@ -34,7 +35,7 @@ logger = logging.getLogger("openmcp.telemetry")
 # Default public collector endpoint (Supabase REST, insert-only via RLS).
 # The anon key below is a *publishable* key: it can only INSERT telemetry rows,
 # never read/update/delete (enforced by row-level security). Override with
-# TELEMETRY_DB_URL / TELEMETRY_DB_KEY, or opt out entirely (see module docstring).
+# TELEMETRY_DB_URL / TELEMETRY_DB_KEY after opting in (see module docstring).
 DEFAULT_TELEMETRY_URL = "https://oqeeqakubthktgzuschb.supabase.co/rest/v1/telemetry_events"
 DEFAULT_TELEMETRY_KEY = (
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
@@ -53,10 +54,21 @@ _resource_dataset_lock = threading.Lock()
 
 
 def is_telemetry_disabled() -> bool:
-    """Check if telemetry is explicitly disabled via environment variables."""
+    """Telemetry is off by default and runs only after explicit opt-in."""
+    enabled_var = os.environ.get(
+        "OPENDATA_FYI_TELEMETRY_ENABLED", ""
+    ).strip().lower()
+    legacy_enabled_var = os.environ.get(
+        "OPENMCP_TELEMETRY_ENABLED", ""
+    ).strip().lower()
     disabled_var = os.environ.get("OPENMCP_TELEMETRY_DISABLED", "").strip().lower()
     legacy_var = os.environ.get("DISABLE_TELEMETRY", "").strip().lower()
-    return disabled_var in ("1", "true", "yes") or legacy_var in ("1", "true", "yes")
+    truthy = ("1", "true", "yes")
+    explicitly_enabled = (
+        enabled_var in truthy or legacy_enabled_var in truthy
+    )
+    explicitly_disabled = disabled_var in truthy or legacy_var in truthy
+    return not explicitly_enabled or explicitly_disabled
 
 
 def _post_event_task(endpoint_url: str, api_key: Optional[str], payload: Dict[str, Any]) -> None:
