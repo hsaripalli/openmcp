@@ -13,6 +13,9 @@ catalog.duckdb.tmp
 *.jsonl.gz
 *.jsonl
 
+# Private analysis workspace (never commit or deploy)
+/analysis/
+
 # Environment variables & local configuration
 .env
 .env.local
@@ -26,4 +29,3 @@ catalog.duckdb.tmp
 
 # Frontend project / build artifacts
 frontend/
-
