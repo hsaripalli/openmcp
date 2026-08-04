@@ -31,3 +31,8 @@ catalog.duckdb.tmp
 
 # Frontend project / build artifacts
 frontend/
+
+# Internal docs
+WEBSITE_CONTENT.md
+ROADMAP.md
+
