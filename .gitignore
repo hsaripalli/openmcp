@@ -15,6 +15,8 @@ catalog.duckdb.tmp
 
 # Private analysis workspace (never commit or deploy)
 /analysis/
+/outputs/
+/tmp/
 
 # Environment variables & local configuration
 .env

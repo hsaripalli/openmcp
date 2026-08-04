@@ -14,9 +14,14 @@ from telemetry import (
     record_telemetry_event,
     register_dataset_resources,
 )
+from structured_results import make_error_result, make_tool_result
+from version import __version__
 
 
 class TestTelemetry(unittest.TestCase):
+
+    def test_server_version_matches_release_version(self):
+        self.assertEqual(SERVER_VERSION, __version__)
 
     def setUp(self):
         # Clear telemetry env vars before each test
@@ -81,6 +86,21 @@ class TestTelemetry(unittest.TestCase):
             ["aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"],
         )
         self.assertIsNone(payload["error_code"])
+
+    @patch("telemetry._executor.submit")
+    def test_source_qualified_dataset_ids_are_preserved(self, mock_submit):
+        os.environ["OPENDATA_FYI_TELEMETRY_ENABLED"] = "true"
+
+        record_telemetry_event(
+            tool_name="get_dataset",
+            dataset_ids=["alberta:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"],
+        )
+
+        payload = mock_submit.call_args[0][3]
+        self.assertEqual(
+            payload["dataset_ids"],
+            ["alberta:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"],
+        )
 
     @patch("telemetry._executor.submit")
     def test_record_event_when_disabled(self, mock_submit):
@@ -195,6 +215,37 @@ class TestTelemetry(unittest.TestCase):
         self.assertEqual(kwargs["status"], "error")
         self.assertEqual(kwargs["error_code"], "ToolReturnedError")
         self.assertNotIn("sensitive details", str(kwargs))
+
+    @patch("telemetry.record_telemetry_event")
+    def test_structured_results_preserve_dataset_ids_and_error_codes(self, mock_record):
+        dataset_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+        @log_telemetry("structured_search")
+        def structured_search():
+            return make_tool_result(
+                "result",
+                datasets=[{"id": dataset_id, "title": "Example"}],
+            )
+
+        structured_search()
+        kwargs = mock_record.call_args[1]
+        self.assertEqual(kwargs["dataset_ids"], [dataset_id])
+        self.assertEqual(kwargs["status"], "success")
+
+        mock_record.reset_mock()
+
+        @log_telemetry("structured_error")
+        def structured_error():
+            return make_error_result(
+                "temporary failure",
+                code="SearchUnavailable",
+                retryable=True,
+            )
+
+        structured_error()
+        kwargs = mock_record.call_args[1]
+        self.assertEqual(kwargs["status"], "error")
+        self.assertEqual(kwargs["error_code"], "SearchUnavailable")
 
 
 if __name__ == "__main__":

@@ -14,8 +14,9 @@ OpenMCP Canada — Ask questions of Canadian open data
 
 **Meta description**
 
-Connect your AI assistant to 24,000+ Government of Canada datasets. Discover,
-query, and cite public data in plain English with no API keys required.
+Connect your AI assistant to 75,000 official datasets and statistical tables
+from Canada, Alberta, Ontario, and Statistics Canada. Discover, query, and cite
+public data in plain English with no API keys required.
 
 **Social sharing title**
 
@@ -23,14 +24,16 @@ Canadian open data, ready for your AI assistant
 
 **Social sharing description**
 
-OpenMCP Canada helps MCP-compatible AI assistants find and query 24,000+
-Government of Canada datasets—and return answers with links to the source.
+OpenMCP Canada helps MCP-compatible AI assistants find and query 75,000
+official datasets and statistical tables—and return answers with links to the
+source.
 
 ---
 
 ## Navigation
 
 - How it works
+- Sources
 - What it can do
 - Get started
 - FAQ
@@ -52,9 +55,10 @@ Ask questions of Canadian open data.
 
 **Supporting copy**
 
-OpenMCP Canada connects your AI assistant to 24,000+ datasets from the
-Government of Canada. Find the right data, query it in place, and get an answer
-with links back to the official source.
+OpenMCP Canada connects your AI assistant to 75,000 datasets and statistical
+tables from federal, Alberta, Ontario, and Statistics Canada sources. Find the
+right data, query it in place, and get an answer with links back to the official
+source.
 
 **Primary button**
 
@@ -107,9 +111,9 @@ Traceable path to data.
 
 ### 1. Discover
 
-OpenMCP combines semantic search with the Government of Canada portal’s keyword
-search, so your assistant can find relevant datasets even when your wording
-does not match the catalogue exactly.
+OpenMCP combines a shared semantic index with live keyword searches of the
+Canada, Alberta, and Ontario catalogues. The complete Statistics Canada WDS
+table inventory participates in semantic discovery.
 
 ### 2. Inspect
 
@@ -124,8 +128,8 @@ from PDF reports.
 
 ### 4. Cite
 
-Results include a link back to the dataset on open.canada.ca, so you can inspect
-the official source yourself.
+Results include a link back to the authoritative federal, provincial, or
+Statistics Canada page so you can inspect the official source yourself.
 
 ---
 
@@ -147,12 +151,13 @@ in an answer.
 ### Search by meaning
 
 Find datasets with natural-language questions using hybrid semantic and keyword
-search across a local index of 24,000+ catalogue entries.
+search across a local index of 75,000 catalogue entries and statistical tables.
 
 ### Query at the source
 
-Filter datastore-backed resources on Government of Canada servers, so only the
-rows you need are returned.
+Filter datastore-backed resources on federal and provincial CKAN servers, so
+only the rows you need are returned. Query bounded StatCan metadata and time
+series through the official WDS API.
 
 ### Work across formats
 
@@ -171,8 +176,8 @@ to prevent write and data-definition operations.
 
 ### Follow every answer back
 
-Dataset results include links to open.canada.ca for verification, context, and
-reuse.
+Dataset results include authoritative federal, Alberta, Ontario, or Statistics
+Canada links for verification, context, and reuse.
 
 ---
 
@@ -279,8 +284,8 @@ ranges.
 
 **Optional stat row**
 
-- 24,000+ indexed datasets
-- 10 MCP tools
+- 75,000 indexed datasets
+- 12 MCP tools
 - 3 guided MCP prompts
 - 0 API keys
 
@@ -304,7 +309,7 @@ catalogue index, and add OpenMCP to your client’s MCP configuration.
 **Step 1 label:** Install
 
 ```bash
-git clone https://github.com/hsaripalli/openmcp.git
+git clone https://github.com/opendatafyi/openmcp.git
 cd openmcp
 python3 -m venv venv
 venv/bin/pip install -r requirements.txt
@@ -371,9 +376,9 @@ Read the telemetry documentation
 ### What is OpenMCP Canada?
 
 OpenMCP Canada is an open-source MCP server that helps AI assistants discover
-and query datasets published through the Government of Canada Open Data portal.
-It provides tools for search, dataset inspection, tabular queries, Excel
-workbooks, and PDF reports.
+and query public data from Canada, Alberta, Ontario, and Statistics Canada. It
+provides tools for search, dataset inspection, StatCan WDS access, tabular
+queries, Excel workbooks, and PDF reports.
 
 ### What is MCP?
 
@@ -389,8 +394,8 @@ Cline, Roo Code, Windsurf, Continue, and Goose. Setup details vary by client.
 
 ### Do I need an API key?
 
-No. OpenMCP uses the Government of Canada’s public CKAN API, public dataset
-resources, and a local embedding model.
+No. OpenMCP uses public federal and provincial CKAN APIs, Statistics Canada WDS,
+public dataset resources, and a local embedding model.
 
 ### Does OpenMCP copy all government data to my computer?
 
@@ -400,9 +405,9 @@ server-side filtering or remote file streaming where supported.
 
 ### Is the data official?
 
-OpenMCP searches and queries resources published through open.canada.ca and
-links results back to the source dataset. OpenMCP itself is an independent
-open-source project and is not an official Government of Canada service.
+OpenMCP searches and queries resources published through open.canada.ca,
+open.alberta.ca, data.ontario.ca, and Statistics Canada, then links results back
+to the source dataset. OpenMCP itself is an independent open-source project.
 
 ### What data formats are supported?
 
@@ -410,12 +415,12 @@ OpenMCP can work with CKAN datastore resources and remote CSV, Parquet, JSON,
 ZIP, Excel, PDF, and TXT resources. Support varies with the structure and
 availability of each source file.
 
-### Does it cover every dataset on open.canada.ca?
+### Does it cover every record from every catalogue?
 
-No. Semantic discovery focuses on roughly 24,000 catalogue entries with
-tabular, PDF, or text resources. Other entries, including purely geospatial or
-HTML datasets, can still be found through keyword search but may require other
-tools to query.
+The Statistics Canada index contains its complete active and archived WDS table
+inventory. CKAN discovery indexes records with a supported datastore, tabular
+file, ZIP, PDF, or text resource. Purely geospatial, HTML-only, and unknown
+formats are excluded when the server has no reliable query path for them.
 
 ### Is it safe to query files?
 
@@ -448,8 +453,8 @@ Turn public data into something you can ask.
 
 **Body**
 
-Connect OpenMCP to your AI assistant and start exploring 24,000+ Government of
-Canada datasets in plain English.
+Connect OpenMCP to your AI assistant and start exploring 75,000 official
+datasets and statistical tables in plain English.
 
 **Primary button**
 
@@ -491,14 +496,17 @@ original publisher.
 
 ## Link destinations
 
-- GitHub: `https://github.com/hsaripalli/openmcp`
-- Setup instructions: `https://github.com/hsaripalli/openmcp#quick-start`
+- GitHub: `https://github.com/opendatafyi/openmcp`
+- Setup instructions: `https://github.com/opendatafyi/openmcp#quick-start`
 - Releases / catalogue index:
-  `https://github.com/hsaripalli/openmcp/releases/latest`
-- Issues: `https://github.com/hsaripalli/openmcp/issues`
-- License: `https://github.com/hsaripalli/openmcp/blob/main/LICENSE`
+  `https://github.com/opendatafyi/openmcp/releases/latest`
+- Issues: `https://github.com/opendatafyi/openmcp/issues`
+- License: `https://github.com/opendatafyi/openmcp/blob/main/LICENSE`
 - Government of Canada Open Data:
   `https://open.canada.ca/en/open-data`
+- Alberta Open Data: `https://open.alberta.ca`
+- Ontario Data Catalogue: `https://data.ontario.ca`
+- Statistics Canada WDS: `https://www.statcan.gc.ca/en/developers/wds`
 
 ---
 
@@ -506,12 +514,13 @@ original publisher.
 
 - Use **OpenMCP Canada** on first mention and **OpenMCP** afterward.
 - Lead with the user outcome: asking questions and getting traceable answers.
-- Say **24,000+ indexed datasets**, not “all Canadian public data.”
-- Say **Government of Canada Open Data portal**, not “Government of Canada
-  database.”
+- Say **75,000 indexed datasets and statistical tables**, not “all Canadian
+  public data.”
+- Name the four source families: **Canada, Alberta, Ontario, and Statistics
+  Canada**.
 - Avoid implying that OpenMCP itself generates final answers. It gives an AI
   assistant the tools and source data needed to produce them.
 - Keep the independence disclaimer visible in the footer.
 - Treat privacy as a factual explanation, not a blanket “private” claim:
   discovery is local, public-data requests go to source hosts, and anonymous
-  telemetry is enabled by default but can be disabled.
+  telemetry is off by default unless a user explicitly opts in.

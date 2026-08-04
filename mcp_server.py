@@ -1,9 +1,8 @@
 """
-OpenMCP Canada — open.canada.ca MCP server.
+OpenMCP Canada — authoritative Canadian public-data MCP server.
 
-A focused interface over the Government of Canada Open Data portal (CKAN).
-Discovery and querying go exclusively through the documented CKAN Action API
-(https://open.canada.ca/data/en/api/3/action/, GET-only).
+A focused interface over federal, Alberta, and Ontario CKAN portals plus a
+reviewed catalog of authoritative non-CKAN sources. CKAN access is GET-only.
 
 Flow:
     search_datasets(query)            -> find datasets (package_search)
@@ -49,8 +48,24 @@ from telemetry import (
     log_telemetry,
     register_dataset_resources,
 )
+from structured_results import (
+    SourceReference,
+    StructuredToolResult,
+    make_error_result,
+    make_tool_result,
+)
+from source_registry import (
+    CKAN_SOURCE_IDS,
+    INDEX_SOURCE_IDS,
+    get_source,
+    page_url,
+    qualify_dataset_id,
+    split_dataset_id,
+)
+from resource_policy import is_queryable_resource, resource_format
+from version import __version__
 
-mcp = FastMCP("OpenMCP Canada — open.canada.ca")
+mcp = FastMCP("OpenMCP Canada — authoritative public data")
 
 if is_telemetry_disabled():
     sys.stderr.write(
@@ -63,10 +78,31 @@ else:
     )
 
 
-# ── CKAN Action API (open.canada.ca is GET-only; pass params in the URL) ───────
-CKAN_BASE = "https://open.canada.ca/data/en/api/3/action"
+# ── CKAN Action APIs (GET-only; pass params in the URL) ──────────────────────
 HTTP_TIMEOUT = 20
 QUERY_TIMEOUT = 30
+
+STATCAN_WDS_GUIDE_URL = "https://www.statcan.gc.ca/en/developers/wds/user-guide"
+STATCAN_WDS_METHODS = frozenset({
+    "getChangedSeriesList",
+    "getChangedCubeList",
+    "getCubeMetadata",
+    "getSeriesInfoFromCubePidCoord",
+    "getSeriesInfoFromVector",
+    "getAllCubesList",
+    "getAllCubesListLite",
+    "getChangedSeriesDataFromCubePidCoord",
+    "getChangedSeriesDataFromVector",
+    "getDataFromCubePidCoordAndLatestNPeriods",
+    "getDataFromVectorsAndLatestNPeriods",
+    "getBulkVectorDataByRange",
+    "getDataFromVectorByReferencePeriodRange",
+    "getFullTableDownloadCSV",
+    "getFullTableDownloadSDMX",
+    "getCodeSets",
+})
+MAX_STATCAN_WDS_BATCH = 25
+MAX_STATCAN_WDS_ITEMS = 100
 
 MAX_PREVIEW_ROWS = 15
 MAX_RESULT_ROWS = 100
@@ -74,15 +110,27 @@ MAX_CELL_CHARS = 200
 MAX_DESC_CHARS = 300
 GEO_COL_KEYWORDS = ("polygon", "geom", "wkt", "shape", "multipolygon", "coordinates")
 
-# Persistent DuckDB connection (httpfs loaded once) for the file fallback path.
-_duck = duckdb.connect(":memory:")
-_duck.execute("INSTALL httpfs; LOAD httpfs;")
-
 _WRITE_RE = re.compile(
-    r"\b(insert|update|delete|drop|alter|attach|copy|pragma|"
-    r"create\s+table|create\s+or\s+replace)\b",
+    r"\b(insert|update|delete|drop|alter|attach|copy|pragma|install|load|"
+    r"call|export|import|set|reset|vacuum|create\s+table|"
+    r"create\s+or\s+replace)\b",
     re.IGNORECASE,
 )
+
+
+def _read_only_sql_error(sql: str) -> Optional[str]:
+    """Return validation guidance when SQL is not one read-only SELECT query."""
+    statement = sql.strip()
+    if not statement:
+        return "A SQL query is required."
+    statement = statement[:-1].rstrip() if statement.endswith(";") else statement
+    if ";" in statement:
+        return "Only one SQL statement is permitted."
+    if not re.match(r"^(select|with)\b", statement, re.IGNORECASE):
+        return "Only SELECT queries (including WITH ... SELECT) are permitted."
+    if _WRITE_RE.search(statement):
+        return "Only read-only SQL is permitted."
+    return None
 
 
 # ── robust remote file download ──────────────────────────────────────────────
@@ -133,9 +181,12 @@ def _robust_get(url: str, timeout: int = None) -> requests.Response:
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
-def _ckan_get(action: str, **params) -> Dict[str, Any]:
+def _ckan_get(action: str, *, source_id: str = "canada", **params) -> Dict[str, Any]:
     """Call a CKAN Action API endpoint (GET) and return the `result` payload."""
-    resp = _dl_session.get(f"{CKAN_BASE}/{action}", params=params, timeout=HTTP_TIMEOUT)
+    source = get_source(source_id)
+    if source.source_type != "ckan" or not source.api_base:
+        raise ValueError(f"Source '{source_id}' does not expose a CKAN Action API.")
+    resp = _dl_session.get(f"{source.api_base}/{action}", params=params, timeout=HTTP_TIMEOUT)
     resp.raise_for_status()
     body = resp.json()
     if not body.get("success"):
@@ -143,10 +194,233 @@ def _ckan_get(action: str, **params) -> Dict[str, Any]:
     return body.get("result", {})
 
 
+def _statcan_product_id(value: str) -> int:
+    """Validate a Statistics Canada Product ID, qualified ID, or table URL."""
+    text = str(value or "").strip()
+    if text.startswith("statcan:") or "statcan.gc.ca" in text:
+        source_id, text = split_dataset_id(text)
+        if source_id != "statcan":
+            raise ValueError("The dataset identifier must refer to Statistics Canada.")
+    if not re.fullmatch(r"\d{8}(?:\d{2})?", text):
+        raise ValueError("product_id must contain an 8-digit PID (or 10-digit table view PID).")
+    return int(text)
+
+
+def _statcan_vector_ids(value: str) -> List[int]:
+    """Parse and bound a comma-separated list of StatCan vector identifiers."""
+    raw_ids = [part.strip().strip('"\'') for part in str(value or "").split(",")]
+    raw_ids = [part[1:] if part.lower().startswith("v") else part for part in raw_ids if part]
+    if not raw_ids:
+        raise ValueError("vector_ids must contain at least one vector identifier.")
+    if len(raw_ids) > MAX_STATCAN_WDS_BATCH:
+        raise ValueError(f"At most {MAX_STATCAN_WDS_BATCH} vector identifiers are permitted per call.")
+    if any(not re.fullmatch(r"\d{1,10}", part) for part in raw_ids):
+        raise ValueError("Each vector identifier must be V followed by 1-10 digits, or just 1-10 digits.")
+    return [int(part) for part in raw_ids]
+
+
+def _statcan_date(value: str, name: str, *, timestamp: bool = False) -> str:
+    """Validate the ISO date forms accepted by the WDS endpoints."""
+    text = str(value or "").strip()
+    pattern = r"\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2})?)?" if timestamp else r"\d{4}-\d{2}-\d{2}"
+    if not re.fullmatch(pattern, text):
+        suffix = " with an optional THH:MM[:SS] time" if timestamp else ""
+        raise ValueError(f"{name} must use YYYY-MM-DD{suffix} format.")
+    return text
+
+
+def _statcan_coordinate(value: str) -> str:
+    """Validate a one-to-ten dimension WDS coordinate."""
+    text = str(value or "").strip()
+    if not re.fullmatch(r"\d+(?:\.\d+){0,9}", text):
+        raise ValueError("coordinate must contain 1-10 dot-separated numeric member IDs.")
+    return text
+
+
+def _statcan_wds_request(
+    method: str,
+    *,
+    product_id: str = "",
+    coordinate: str = "",
+    vector_ids: str = "",
+    latest_n: int = 3,
+    start_date: str = "",
+    end_date: str = "",
+    language: str = "en",
+) -> Tuple[Any, str, str]:
+    """Build and execute one allowlisted Statistics Canada WDS request."""
+    if method not in STATCAN_WDS_METHODS:
+        allowed = ", ".join(sorted(STATCAN_WDS_METHODS))
+        raise ValueError(f"Unsupported WDS method '{method}'. Allowed methods: {allowed}")
+
+    source = get_source("statcan")
+    url = f"{source.api_base}/{method}"
+    request_method = "GET"
+    request_kwargs: Dict[str, Any] = {"timeout": HTTP_TIMEOUT}
+
+    no_argument_gets = {
+        "getChangedSeriesList", "getAllCubesList", "getAllCubesListLite", "getCodeSets",
+    }
+    product_posts = {"getCubeMetadata"}
+    coordinate_posts = {
+        "getSeriesInfoFromCubePidCoord", "getChangedSeriesDataFromCubePidCoord",
+    }
+    vector_posts = {"getSeriesInfoFromVector", "getChangedSeriesDataFromVector"}
+
+    if method in no_argument_gets:
+        pass
+    elif method == "getChangedCubeList":
+        url += f"/{_statcan_date(start_date, 'start_date')}"
+    elif method in product_posts:
+        request_method = "POST"
+        request_kwargs["json"] = [{"productId": _statcan_product_id(product_id)}]
+    elif method in coordinate_posts:
+        request_method = "POST"
+        request_kwargs["json"] = [{
+            "productId": _statcan_product_id(product_id),
+            "coordinate": _statcan_coordinate(coordinate),
+        }]
+    elif method in vector_posts:
+        request_method = "POST"
+        request_kwargs["json"] = [
+            {"vectorId": vector_id} for vector_id in _statcan_vector_ids(vector_ids)
+        ]
+    elif method == "getDataFromCubePidCoordAndLatestNPeriods":
+        if not 1 <= latest_n <= MAX_STATCAN_WDS_ITEMS:
+            raise ValueError(f"latest_n must be between 1 and {MAX_STATCAN_WDS_ITEMS}.")
+        request_method = "POST"
+        request_kwargs["json"] = [{
+            "productId": _statcan_product_id(product_id),
+            "coordinate": _statcan_coordinate(coordinate),
+            "latestN": latest_n,
+        }]
+    elif method == "getDataFromVectorsAndLatestNPeriods":
+        if not 1 <= latest_n <= MAX_STATCAN_WDS_ITEMS:
+            raise ValueError(f"latest_n must be between 1 and {MAX_STATCAN_WDS_ITEMS}.")
+        request_method = "POST"
+        request_kwargs["json"] = [
+            {"vectorId": vector_id, "latestN": latest_n}
+            for vector_id in _statcan_vector_ids(vector_ids)
+        ]
+    elif method == "getBulkVectorDataByRange":
+        request_method = "POST"
+        request_kwargs["json"] = {
+            "vectorIds": [str(value) for value in _statcan_vector_ids(vector_ids)],
+            "startDataPointReleaseDate": _statcan_date(start_date, "start_date", timestamp=True),
+            "endDataPointReleaseDate": _statcan_date(end_date, "end_date", timestamp=True),
+        }
+    elif method == "getDataFromVectorByReferencePeriodRange":
+        vectors = _statcan_vector_ids(vector_ids)
+        request_kwargs["params"] = {
+            "vectorIds": ",".join(f'"{value}"' for value in vectors),
+            "startRefPeriod": _statcan_date(start_date, "start_date"),
+            "endReferencePeriod": _statcan_date(end_date, "end_date"),
+        }
+    elif method == "getFullTableDownloadCSV":
+        lang = str(language or "").strip().lower()
+        if lang not in {"en", "fr"}:
+            raise ValueError("language must be 'en' or 'fr'.")
+        url += f"/{_statcan_product_id(product_id)}/{lang}"
+    elif method == "getFullTableDownloadSDMX":
+        url += f"/{_statcan_product_id(product_id)}"
+
+    caller = _dl_session.post if request_method == "POST" else _dl_session.get
+    response = caller(url, **request_kwargs)
+    response.raise_for_status()
+    return response.json(), request_method, url
+
+
+def _truncate_statcan_response(value: Any, limit: int, state: Dict[str, bool]) -> Any:
+    """Bound nested WDS lists and long strings so MCP responses stay usable."""
+    if isinstance(value, list):
+        if len(value) > limit:
+            state["truncated"] = True
+        return [_truncate_statcan_response(item, limit, state) for item in value[:limit]]
+    if isinstance(value, dict):
+        return {
+            str(key): _truncate_statcan_response(item, limit, state)
+            for key, item in value.items()
+        }
+    if isinstance(value, str) and len(value) > 2000:
+        state["truncated"] = True
+        return value[:2000] + "…"
+    return value
+
+
+def _statcan_rows(value: Any) -> List[Dict[str, Any]]:
+    """Represent the varying WDS response envelopes in the common rows field."""
+    if isinstance(value, list):
+        return [item if isinstance(item, dict) else {"value": item} for item in value]
+    if isinstance(value, dict):
+        return [value]
+    return [{"value": value}]
+
+
 def _extract_dataset_id(dataset_id: str) -> str:
-    """Accept a bare id/slug or a full open.canada.ca dataset URL."""
-    m = re.search(r"/dataset/([0-9a-f-]{36}|[\w-]+)", dataset_id)
-    return m.group(1) if m else dataset_id.strip()
+    """Return the native ID from a qualified ID, legacy ID, or known page URL."""
+    return split_dataset_id(dataset_id)[1]
+
+
+def _plain_english(value: Any) -> str:
+    """Normalize bilingual CKAN values for display and embedding records."""
+    if isinstance(value, dict):
+        value = value.get("en") or value.get("fr") or next(iter(value.values()), "")
+    if not value:
+        return ""
+    text = str(value).strip()
+    return text.split("|")[0].strip() if "|" in text else text
+
+
+def _catalog_record_from_ckan(raw: Dict[str, Any], source_id: str,
+                              require_supported: bool = True
+                              ) -> Optional[Dict[str, Any]]:
+    """Normalize a live CKAN package into the shared catalog record shape."""
+    native_id = raw.get("id") or raw.get("name")
+    if not native_id:
+        return None
+    resources = []
+    has_supported_resource = False
+    for resource in raw.get("resources", []):
+        if not is_queryable_resource(resource):
+            continue
+        fmt = resource_format(resource)
+        has_supported_resource = True
+        resources.append({
+            "id": resource.get("id", ""),
+            "name": _plain_english(resource.get("name")),
+            "format": fmt,
+            "url": resource.get("url", ""),
+            "datastore_active": bool(resource.get("datastore_active", False)),
+        })
+    if require_supported and not has_supported_resource:
+        return None
+    organization = raw.get("organization") or {}
+    title = _plain_english(raw.get("title_translated") or raw.get("title") or raw.get("name"))
+    return {
+        "id": qualify_dataset_id(source_id, native_id),
+        "native_id": native_id,
+        "source_id": source_id,
+        "source_type": "ckan",
+        "title": title or "Untitled",
+        "org": _plain_english(
+            organization.get("title_translated") or organization.get("title")
+        ),
+        "notes": _plain_english(raw.get("notes_translated") or raw.get("notes")),
+        "topic": _plain_english(raw.get("topic_category") or raw.get("subject")),
+        "resources": resources,
+        "metadata_modified": raw.get("metadata_modified", ""),
+        "page_url": page_url(source_id, native_id),
+        "distance": None,
+    }
+
+
+def _canonical_resource_urls(dataset: Dict[str, Any]) -> set[str]:
+    """Return normalized resource URLs for federated-record de-duplication."""
+    return {
+        str(resource.get("url", "")).strip().lower().rstrip("/")
+        for resource in dataset.get("resources", [])
+        if resource.get("url")
+    }
 
 
 def _truncate_desc(text: str) -> str:
@@ -186,17 +460,57 @@ def _df_to_md(df: pd.DataFrame, cap: int = MAX_RESULT_ROWS, offset: int = 0,
     return md
 
 
+def _df_to_structured(df: pd.DataFrame, cap: int = MAX_RESULT_ROWS
+                      ) -> Tuple[List[Dict[str, str]], List[Dict[str, Any]]]:
+    """Convert a dataframe into JSON-safe column metadata and capped records."""
+    limited = df.head(max(0, cap))
+    columns = [
+        {"name": str(column), "type": str(dtype)}
+        for column, dtype in limited.dtypes.items()
+    ]
+    # pandas' JSON encoder consistently handles NA, timestamps and numpy scalars.
+    rows = json.loads(limited.to_json(orient="records", date_format="iso"))
+    return columns, rows
+
+
+def _new_duckdb_connection() -> duckdb.DuckDBPyConnection:
+    """Create an isolated DuckDB connection for one query."""
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute("LOAD httpfs")
+    except Exception:
+        # Installation is normally already cached. This fallback supports a clean
+        # machine without making every server startup depend on extension loading.
+        con.execute("INSTALL httpfs")
+        con.execute("LOAD httpfs")
+    return con
+
+
 def run_query_with_timeout(sql: str, timeout_sec: int = QUERY_TIMEOUT) -> pd.DataFrame:
-    """Run a DuckDB query on the shared connection with a wall-clock timeout."""
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-        fut = ex.submit(lambda: _duck.execute(sql).fetchdf())
+    """Run a DuckDB query on an isolated connection with a wall-clock timeout."""
+    con = _new_duckdb_connection()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    fut = executor.submit(lambda: con.execute(sql).fetchdf())
+    try:
+        return fut.result(timeout=timeout_sec)
+    except concurrent.futures.TimeoutError:
+        # DuckDB interrupt is safe to call from another thread and prevents the
+        # executor context from silently waiting for a timed-out query to finish.
+        con.interrupt()
         try:
-            return fut.result(timeout=timeout_sec)
-        except concurrent.futures.TimeoutError:
-            raise TimeoutError(
-                f"Query timed out after {timeout_sec}s. If this resource has "
-                f"datastore_active:true, use query_datastore instead (server-side)."
-            )
+            fut.result(timeout=1)
+        except Exception:
+            pass
+        raise TimeoutError(
+            f"Query timed out after {timeout_sec}s. If this resource has "
+            f"datastore_active:true, use query_datastore instead (server-side)."
+        )
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+        if fut.done():
+            con.close()
+        else:
+            fut.add_done_callback(lambda _future: con.close())
 
 
 # ── Excel workbook cache (url → (bytes, timestamp)) ──────────────────────────
@@ -247,18 +561,25 @@ def _detect_header_row(xl: "pd.ExcelFile", sheet_name: Any, max_scan: int = 20) 
 def _query_dataframe(sql: str, df: pd.DataFrame,
                      timeout_sec: int = QUERY_TIMEOUT) -> pd.DataFrame:
     """Run read-only SQL against an in-memory DataFrame (registered as `df`)."""
-    def _run() -> pd.DataFrame:
-        con = duckdb.connect(":memory:")
-        con.register("df", df)
+    con = duckdb.connect(":memory:")
+    con.register("df", df)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    fut = executor.submit(lambda: con.execute(sql).fetchdf())
+    try:
+        return fut.result(timeout=timeout_sec)
+    except concurrent.futures.TimeoutError:
+        con.interrupt()
         try:
-            return con.execute(sql).fetchdf()
-        finally:
+            fut.result(timeout=1)
+        except Exception:
+            pass
+        raise TimeoutError(f"Query timed out after {timeout_sec}s.")
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+        if fut.done():
             con.close()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-        try:
-            return ex.submit(_run).result(timeout=timeout_sec)
-        except concurrent.futures.TimeoutError:
-            raise TimeoutError(f"Query timed out after {timeout_sec}s.")
+        else:
+            fut.add_done_callback(lambda _future: con.close())
 
 
 def _read_tabular(url: str, nrows: Optional[int] = None,
@@ -316,13 +637,14 @@ def _read_tabular(url: str, nrows: Optional[int] = None,
 # =====================================================================
 # DISCOVERY
 # =====================================================================
-@mcp.tool()
+@mcp.tool(structured_output=True)
 @log_telemetry("semantic_search_datasets")
-def semantic_search_datasets(query: str, limit: int = 10) -> str:
+def semantic_search_datasets(query: str, limit: int = 10) -> StructuredToolResult:
     """
-    Find Government of Canada open datasets by semantic meaning or natural language questions.
+    Find authoritative Canadian open datasets by meaning or natural-language questions.
     Uses Reciprocal Rank Fusion (RRF) to combine local semantic vector search (bge-small-en-v1.5,
-    runs locally — no API key) with the live portal's keyword search for maximum accuracy.
+    runs locally — no API key) with concurrent live keyword searches of the federal, Alberta,
+    and Ontario CKAN portals.
     
     Examples:
         - "how much did municipalities spend on infrastructure?"
@@ -333,16 +655,23 @@ def semantic_search_datasets(query: str, limit: int = 10) -> str:
         query: Plain English search term, acronym, or question.
         limit: Max datasets to return (default 8).
     """
+    effective_limit = max(1, min(limit, 25))
+    query_info = {
+        "text": query,
+        "limit": effective_limit,
+        "mode": "hybrid_rrf",
+        "sources": list(INDEX_SOURCE_IDS),
+    }
     if not os.path.exists(DB_PATH):
-        return (
-            "Error: Semantic database catalog is missing.\n\n"
-            "To use this tool, you must build the semantic search index first. "
-            "Please run the following command in the project directory:\n"
-            "```bash\n"
-            "python semantic/build_index.py\n"
-            "```"
+        return make_error_result(
+            "Semantic database catalog is missing.",
+            code="CatalogMissing",
+            query=query_info,
+            recovery="Download catalog.duckdb from the latest release or run python semantic/build_index.py.",
         )
-        
+
+    warnings: List[str] = []
+
     # 1. Retrieve semantic search results (top 25)
     try:
         query_vecs = embed_texts([query], is_query=True)
@@ -353,40 +682,83 @@ def semantic_search_datasets(query: str, limit: int = 10) -> str:
     except Exception as e:
         # Fall back to empty list if local DB search fails
         semantic_results = []
-        
-    # 2. Retrieve keyword search results (top 25) from CKAN API
-    try:
-        keyword_raw = _ckan_get("package_search", q=query, rows=25)
-        keyword_results = keyword_raw.get("results", [])
-    except Exception:
-        # Fall back to empty list if CKAN API is unreachable
-        keyword_results = []
-        
-    if not semantic_results and not keyword_results:
-        return f"No datasets found for query: '{query}'"
-        
+        warnings.append(f"Semantic search was unavailable ({type(e).__name__}); results use keyword search only.")
+
+    # 2. Search all live CKAN portals concurrently. Each portal fails independently.
+    keyword_results: Dict[str, List[Dict[str, Any]]] = {}
+    live_details: Dict[str, Dict[str, Any]] = {}
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=len(CKAN_SOURCE_IDS), thread_name_prefix="CKANSearch"
+    ) as executor:
+        futures = {
+            executor.submit(
+                _ckan_get, "package_search", source_id=source_id,
+                q=query, rows=25
+            ): source_id
+            for source_id in CKAN_SOURCE_IDS
+        }
+        for future in concurrent.futures.as_completed(futures):
+            source_id = futures[future]
+            try:
+                raw_results = future.result().get("results", [])
+                normalized = []
+                for raw in raw_results:
+                    record = _catalog_record_from_ckan(raw, source_id)
+                    if record:
+                        normalized.append(record)
+                        live_details[record["id"]] = record
+                keyword_results[source_id] = normalized
+            except Exception as error:
+                keyword_results[source_id] = []
+                warnings.append(
+                    f"Live search of {get_source(source_id).name} was unavailable "
+                    f"({type(error).__name__})."
+                )
+
+    keyword_count = sum(len(results) for results in keyword_results.values())
+    if not semantic_results and not keyword_count:
+        if len(warnings) >= len(CKAN_SOURCE_IDS) + 1:
+            return make_error_result(
+                "Semantic search and all live keyword searches failed.",
+                code="SearchUnavailable",
+                query=query_info,
+                retryable=True,
+                recovery="Retry the search and verify that catalog.duckdb is readable and the enabled CKAN portals are reachable.",
+                warnings=warnings,
+            )
+        return make_tool_result(
+            f"No datasets found for query: '{query}'",
+            query=query_info,
+            warnings=[*warnings, "No datasets matched the query."],
+        )
+
     # 3. Reciprocal Rank Fusion (RRF)
     rrf_scores = {}
     
     # Semantic Rank Fusion
+    semantic_map: Dict[str, Dict[str, Any]] = {}
     for rank, ds in enumerate(semantic_results, start=1):
-        ds_id = ds["id"]
+        source_id, native_id = split_dataset_id(ds["id"])
+        ds_id = qualify_dataset_id(source_id, native_id)
+        ds = {**ds, "id": ds_id}
+        semantic_map[ds_id] = ds
         rrf_scores[ds_id] = rrf_scores.get(ds_id, 0.0) + (1.0 / (60.0 + rank))
         
-    # Keyword Rank Fusion
-    for rank, ds in enumerate(keyword_results, start=1):
-        ds_id = ds.get("id")
-        if ds_id:
+    # Give each portal its own rank list so a large catalog cannot swamp smaller ones.
+    keyword_ids = set()
+    for source_results in keyword_results.values():
+        for rank, ds in enumerate(source_results, start=1):
+            ds_id = ds["id"]
+            keyword_ids.add(ds_id)
             rrf_scores[ds_id] = rrf_scores.get(ds_id, 0.0) + (1.0 / (60.0 + rank))
             
     # Sort IDs by RRF score descending
     sorted_ids = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)
     
-    # Map of IDs to distances from semantic search for display
-    semantic_map = {ds["id"]: ds for ds in semantic_results}
-    
-    # 4. Batch retrieve full records from DuckDB to filter for queryable/tabular datasets
+    # 4. Prefer indexed metadata, but retain live results not yet present locally.
     all_details = get_by_ids(sorted_ids)
+    for ds_id, record in live_details.items():
+        all_details.setdefault(ds_id, record)
     
     fused_results = []
     for ds_id in sorted_ids:
@@ -397,7 +769,7 @@ def semantic_search_datasets(query: str, limit: int = 10) -> str:
             
             # Check if this hit came from keyword, semantic, or both
             is_semantic = ds_id in semantic_map
-            is_keyword = any(k.get("id") == ds_id for k in keyword_results)
+            is_keyword = ds_id in keyword_ids
             if is_semantic and is_keyword:
                 ds["match_type"] = "Hybrid"
             elif is_semantic:
@@ -405,14 +777,35 @@ def semantic_search_datasets(query: str, limit: int = 10) -> str:
             else:
                 ds["match_type"] = "Keyword"
             fused_results.append(ds)
-            
-    # Crop to the requested limit
-    fused_results = fused_results[:limit]
+
+    # Remove the same authoritative dataset when it is federated across portals.
+    deduplicated = []
+    seen_resource_urls: set[str] = set()
+    seen_pages: set[str] = set()
+    for dataset in fused_results:
+        resource_urls = _canonical_resource_urls(dataset)
+        public_page = str(
+            dataset.get("page_url") or dataset.get("id", "")
+        ).lower().rstrip("/")
+        if resource_urls & seen_resource_urls or (
+            not resource_urls and public_page in seen_pages
+        ):
+            continue
+        seen_resource_urls.update(resource_urls)
+        seen_pages.add(public_page)
+        deduplicated.append(dataset)
+    fused_results = deduplicated[:effective_limit]
 
     if not fused_results:
-        return f"No queryable tabular datasets found matching: '{query}'"
+        return make_tool_result(
+            f"No queryable tabular datasets found matching: '{query}'",
+            query=query_info,
+            warnings=[*warnings, "Matches were found, but none were present in the queryable local catalog."],
+        )
 
     md = [f"### Hybrid Search Results (RRF) for '{query}' (showing top {len(fused_results)})\n"]
+    datasets: List[Dict[str, Any]] = []
+    sources: List[SourceReference] = []
     for ds in fused_results:
         title = ds["title"]
         org = ds["org"] or "Unknown Publisher"
@@ -425,6 +818,8 @@ def semantic_search_datasets(query: str, limit: int = 10) -> str:
         xlsx_count = sum(1 for r in resources if r["format"] in ("XLSX", "XLS"))
         parquet_count = sum(1 for r in resources if r["format"] == "PARQUET")
         json_count = sum(1 for r in resources if r["format"] == "JSON")
+        zip_count = sum(1 for r in resources if r["format"] == "ZIP")
+        pdf_count = sum(1 for r in resources if r["format"] == "PDF")
         datastore_count = sum(1 for r in resources if r["datastore_active"])
         
         res_summary_parts = []
@@ -436,15 +831,55 @@ def semantic_search_datasets(query: str, limit: int = 10) -> str:
             res_summary_parts.append(f"{parquet_count} Parquet")
         if json_count:
             res_summary_parts.append(f"{json_count} JSON")
+        if zip_count:
+            res_summary_parts.append(f"{zip_count} ZIP")
+        if pdf_count:
+            res_summary_parts.append(f"{pdf_count} PDF")
             
         res_summary = ", ".join(res_summary_parts) if res_summary_parts else "No tabular files"
         if datastore_count:
             res_summary += f" ({datastore_count} API-enabled datastores)"
             
-        page = f"https://open.canada.ca/data/en/dataset/{ds_id}"
+        source_id = ds.get("source_id", split_dataset_id(ds_id)[0])
+        source_type = ds.get("source_type", "ckan")
+        native_id = ds.get("native_id", split_dataset_id(ds_id)[1])
+        page = ds.get("page_url") or page_url(source_id, native_id)
+
+        resource_counts = {
+            "csv": csv_count,
+            "excel": xlsx_count,
+            "parquet": parquet_count,
+            "json": json_count,
+            "zip": zip_count,
+            "pdf": pdf_count,
+            "datastore": datastore_count,
+        }
+        datasets.append({
+            "id": ds_id,
+            "native_id": native_id,
+            "source_id": source_id,
+            "source_type": source_type,
+            "title": title,
+            "publisher": org,
+            "description": desc,
+            "page_url": page,
+            "metadata_modified": ds.get("metadata_modified", ""),
+            "resources": resources,
+            "metadata": ds.get("metadata", {}),
+            "resource_counts": resource_counts,
+            "match_type": ds["match_type"],
+            "rrf_score": ds["rrf_score"],
+            "cosine_distance": ds["distance"],
+        })
+        sources.append(SourceReference(
+            title=title,
+            url=page,
+            dataset_id=ds_id,
+        ))
         
         md.append(f"**[{title}]({page})**")
         md.append(f"- **Publisher**: {org}")
+        md.append(f"- **Catalog source**: {get_source(source_id).name}")
         md.append(f"- **Description**: {desc}")
         md.append(f"- **Resources**: {res_summary}")
         md.append(f"- **Dataset id**: `{ds_id}` → `get_dataset('{ds_id}')`")
@@ -455,42 +890,54 @@ def semantic_search_datasets(query: str, limit: int = 10) -> str:
         md.append(f"- **Search Info**: {match_info}")
         md.append("")
         
-    return "\n".join(md)
+    return make_tool_result(
+        "\n".join(md),
+        datasets=datasets,
+        sources=sources,
+        query=query_info,
+        warnings=warnings,
+    )
 
 
 @mcp.tool()
 @log_telemetry("search_datasets")
-def search_datasets(query: str, limit: int = 5) -> str:
+def search_datasets(query: str, limit: int = 5, source_id: str = "canada") -> str:
     """
-    Search the Government of Canada Open Data portal (open.canada.ca) for datasets.
+    Search one registered CKAN portal for datasets.
     Uses the CKAN package_search API.
 
     Args:
         query: Keywords (e.g., "alberta well licences", "population census").
         limit: Max datasets to return (default 5).
+        source_id: canada, alberta, or ontario (default canada).
 
     Returns:
         Markdown list of datasets with title, organization, description, and the
         dataset id to pass to get_dataset.
     """
     try:
-        result = _ckan_get("package_search", q=query, rows=max(1, min(limit, 25)))
+        source = get_source(source_id)
+        result = _ckan_get(
+            "package_search", source_id=source.id,
+            q=query, rows=max(1, min(limit, 25))
+        )
     except Exception as e:
-        return f"Error searching open.canada.ca: {e}"
+        return f"Error searching source '{source_id}': {e}"
 
     results = result.get("results", [])
     if not results:
         return f"No datasets found for '{query}'."
 
-    md = [f"### open.canada.ca results for '{query}' "
+    md = [f"### {source.name} results for '{query}' "
           f"({result.get('count', 0)} total, showing {len(results)})\n"]
     for ds in results:
         title = ds.get("title") or ds.get("name", "Untitled")
         org = (ds.get("organization") or {}).get("title", "Unknown org")
         desc = _truncate_desc(ds.get("notes", ""))
-        ds_id = ds.get("id", "")
+        native_id = ds.get("id", "")
+        ds_id = qualify_dataset_id(source.id, native_id)
         n_res = len(ds.get("resources", []))
-        page = f"https://open.canada.ca/data/en/dataset/{ds_id}"
+        page = source.page_url(native_id)
         md.append(f"**[{title}]({page})**")
         md.append(f"- **Publisher**: {org}")
         md.append(f"- **Description**: {desc}")
@@ -500,12 +947,12 @@ def search_datasets(query: str, limit: int = 5) -> str:
     return "\n".join(md)
 
 
-@mcp.tool()
+@mcp.tool(structured_output=True)
 @log_telemetry("get_dataset")
-def get_dataset(dataset_id: str) -> str:
+def get_dataset(dataset_id: str) -> StructuredToolResult:
     """
-    Get a dataset's metadata and all its resources (CKAN package_show).
-    Accepts a dataset id/slug or a full open.canada.ca dataset URL.
+    Get a dataset's metadata and resources from its authoritative source.
+    Accepts a source-qualified ID, a legacy federal ID, or a known dataset URL.
 
     For each resource it reports the format and whether it is datastore-backed:
       - datastore_active: true  → query it server-side with query_datastore(resource_id, ...)
@@ -514,16 +961,44 @@ def get_dataset(dataset_id: str) -> str:
     Returns:
         Markdown: title, org, description, and a resource table with ids and formats.
     """
-    ds_id = _extract_dataset_id(dataset_id)
     try:
-        ds = _ckan_get("package_show", id=ds_id)
-    except Exception as e:
-        return f"Error fetching dataset '{ds_id}': {e}"
+        source_id, native_id = split_dataset_id(dataset_id)
+        source = get_source(source_id)
+        ds_id = qualify_dataset_id(source_id, native_id)
+    except ValueError as error:
+        return make_error_result(
+            str(error), code="InvalidDatasetId",
+            query={"dataset_id": dataset_id, "operation": "get_dataset"},
+            recovery="Use a result ID returned by semantic_search_datasets.",
+        )
 
-    title = ds.get("title") or ds.get("name", "Untitled")
-    org = (ds.get("organization") or {}).get("title", "Unknown org")
+    query_info = {
+        "dataset_id": ds_id,
+        "native_id": native_id,
+        "source_id": source_id,
+        "operation": "package_show" if source.source_type == "ckan" else "catalog_lookup",
+    }
+    try:
+        if source.source_type == "ckan":
+            raw = _ckan_get("package_show", source_id=source_id, id=native_id)
+            ds = _catalog_record_from_ckan(raw, source_id, require_supported=False)
+        else:
+            ds = get_by_ids([ds_id]).get(ds_id)
+        if not ds:
+            raise LookupError("Dataset was not found or has no supported resources.")
+    except Exception as e:
+        return make_error_result(
+            f"Could not fetch dataset '{ds_id}': {e}",
+            code="DatasetFetchFailed",
+            query=query_info,
+            retryable=source.source_type == "ckan",
+            recovery="Verify the source-qualified dataset ID and rebuild that source's catalog metadata.",
+        )
+
+    title = ds.get("title") or "Untitled"
+    org = ds.get("org") or "Unknown org"
     desc = _truncate_desc(ds.get("notes", ""))
-    page = f"https://open.canada.ca/data/en/dataset/{ds_id}"
+    page = ds.get("page_url") or source.page_url(native_id)
 
     md = [f"## [{title}]({page})", f"**Publisher**: {org}",
           f"**Source**: {page}", f"**Description**: {desc}", ""]
@@ -548,11 +1023,172 @@ def get_dataset(dataset_id: str) -> str:
     if queryable:
         rid = queryable[0]["resource_id"]
         md.append(f"**Tip**: `{queryable[0]['name']}` is datastore-backed → "
-                  f"`query_datastore('{rid}', q='...')` (server-side, no download).")
+                  f"`query_datastore('{rid}', q='...', source_id='{source_id}')` "
+                  "(server-side, no download).")
     else:
         md.append("**Tip**: no datastore-backed resources here — use "
                   "`query_remote_file(url, sql)` on a CSV/Parquet resource above.")
-    return "\n".join(md)
+    structured_resources = []
+    for raw_resource, row in zip(resources, rows):
+        structured_resources.append({
+            "id": row["resource_id"],
+            "name": row["name"],
+            "format": row["format"],
+            "url": row["url"],
+            "datastore_active": bool(raw_resource.get("datastore_active")),
+        })
+
+    warnings = [] if resources else ["This dataset does not list any resources."]
+    return make_tool_result(
+        "\n".join(md),
+        datasets=[{
+            "id": ds_id,
+            "native_id": native_id,
+            "source_id": source_id,
+            "source_type": source.source_type,
+            "title": title,
+            "publisher": org,
+            "description": desc,
+            "page_url": page,
+            "metadata_modified": ds.get("metadata_modified", ""),
+            "resources": structured_resources,
+            "metadata": ds.get("metadata", {}),
+        }],
+        sources=[SourceReference(title=title, url=page, dataset_id=ds_id)],
+        query=query_info,
+        warnings=warnings,
+    )
+
+
+@mcp.tool(structured_output=True)
+@log_telemetry("query_statcan_wds")
+def query_statcan_wds(
+    method: str,
+    product_id: str = "",
+    coordinate: str = "",
+    vector_ids: str = "",
+    latest_n: int = 3,
+    start_date: str = "",
+    end_date: str = "",
+    language: str = "en",
+    max_items: int = 25,
+) -> StructuredToolResult:
+    """Call an official Statistics Canada Web Data Service method.
+
+    This is a read-only, allowlisted gateway to the WDS methods documented by
+    Statistics Canada. Only parameters used by the selected method are read.
+    Responses are bounded before being returned to the MCP client.
+
+    Common examples:
+      - method="getCubeMetadata", product_id="17100009"
+      - method="getDataFromVectorsAndLatestNPeriods",
+        vector_ids="V1,V2", latest_n=3
+      - method="getDataFromCubePidCoordAndLatestNPeriods",
+        product_id="35100003", coordinate="1.12.0.0.0.0.0.0.0.0", latest_n=3
+      - method="getChangedCubeList", start_date="2026-07-31"
+      - method="getFullTableDownloadCSV", product_id="17100009", language="en"
+
+    Args:
+        method: Exact official WDS method name.
+        product_id: StatCan PID, statcan-qualified ID, or StatCan table URL.
+        coordinate: Dot-separated dimension member coordinate.
+        vector_ids: Comma-separated vector IDs, with optional V prefixes.
+        latest_n: Latest reference periods to return (1-100).
+        start_date: ISO start/release date required by range/change methods.
+        end_date: ISO end date required by range methods.
+        language: Full CSV language, either en or fr.
+        max_items: Maximum items retained in each response list (1-100).
+    """
+    query_info: Dict[str, Any] = {
+        "source_id": "statcan",
+        "operation": "wds",
+        "method": method,
+        "product_id": product_id,
+        "coordinate": coordinate,
+        "vector_ids": vector_ids,
+        "latest_n": latest_n,
+        "start_date": start_date,
+        "end_date": end_date,
+        "language": language,
+        "max_items": max_items,
+    }
+    if not 1 <= max_items <= MAX_STATCAN_WDS_ITEMS:
+        return make_error_result(
+            f"max_items must be between 1 and {MAX_STATCAN_WDS_ITEMS}.",
+            code="InvalidStatCanWDSRequest",
+            query=query_info,
+            recovery="Choose a max_items value in the supported range.",
+        )
+
+    try:
+        body, http_method, endpoint = _statcan_wds_request(
+            method,
+            product_id=product_id,
+            coordinate=coordinate,
+            vector_ids=vector_ids,
+            latest_n=latest_n,
+            start_date=start_date,
+            end_date=end_date,
+            language=language,
+        )
+    except ValueError as error:
+        return make_error_result(
+            str(error),
+            code="InvalidStatCanWDSRequest",
+            query=query_info,
+            recovery="Use an official method name and provide the parameters required by that method.",
+        )
+    except requests.RequestException as error:
+        return make_error_result(
+            f"Statistics Canada WDS request failed: {error}",
+            code="StatCanWDSUnavailable",
+            query=query_info,
+            retryable=True,
+            recovery="Retry the request; tables may be temporarily locked during Statistics Canada updates.",
+        )
+    except Exception as error:
+        return make_error_result(
+            f"Statistics Canada WDS returned an invalid response: {error}",
+            code="InvalidStatCanWDSResponse",
+            query=query_info,
+            retryable=True,
+            recovery="Retry the request and verify the method parameters against the WDS user guide.",
+        )
+
+    state = {"truncated": False}
+    bounded = _truncate_statcan_response(body, max_items, state)
+    rows = _statcan_rows(bounded)
+    warnings = []
+    if state["truncated"]:
+        warnings.append(
+            f"The WDS response was truncated to {max_items} items per list; "
+            "narrow the request or increase max_items for more."
+        )
+
+    query_info.update({"http_method": http_method, "endpoint": endpoint})
+    rendered = json.dumps(bounded, ensure_ascii=False, indent=2)
+    if len(rendered) > 12000:
+        rendered = rendered[:12000] + "\n…"
+        warnings.append("The Markdown rendering was shortened; structured rows contain the bounded response.")
+
+    dataset_id = None
+    if product_id:
+        try:
+            pid = str(_statcan_product_id(product_id))
+            dataset_id = f"statcan:{pid[:-2] if len(pid) == 10 else pid}"
+        except ValueError:
+            pass
+    return make_tool_result(
+        f"## Statistics Canada WDS: `{method}`\n\n```json\n{rendered}\n```",
+        rows=rows,
+        sources=[SourceReference(
+            title=f"Statistics Canada WDS — {method}",
+            url=STATCAN_WDS_GUIDE_URL,
+            dataset_id=dataset_id,
+        )],
+        query=query_info,
+        warnings=warnings,
+    )
 
 
 # =====================================================================
@@ -560,19 +1196,23 @@ def get_dataset(dataset_id: str) -> str:
 # =====================================================================
 @mcp.tool()
 @log_telemetry("get_resource_fields")
-def get_resource_fields(resource_id: str) -> str:
+def get_resource_fields(resource_id: str, source_id: str = "canada") -> str:
     """
     Get the column names and types for a datastore-backed resource — no data download.
     Call this before query_datastore to learn what columns/filters are available.
 
     Args:
         resource_id: The resource UUID (from get_dataset).
+        source_id: CKAN source containing the resource (default canada).
 
     Returns:
         Markdown table of field id + type, plus the resource's total row count.
     """
     try:
-        result = _ckan_get("datastore_search", resource_id=resource_id, limit=0)
+        result = _ckan_get(
+            "datastore_search", source_id=source_id,
+            resource_id=resource_id, limit=0
+        )
     except Exception as e:
         return (f"Error reading fields for '{resource_id}': {e}\n"
                 f"(This resource may not be datastore-backed; try query_remote_file.)")
@@ -584,10 +1224,11 @@ def get_resource_fields(resource_id: str) -> str:
             + df.to_markdown(index=False))
 
 
-@mcp.tool()
+@mcp.tool(structured_output=True)
 @log_telemetry("query_datastore")
 def query_datastore(resource_id: str, q: str = "", filters: str = "",
-                    sort: str = "", limit: int = 50, offset: int = 0) -> str:
+                    sort: str = "", limit: int = 50,
+                    offset: int = 0, source_id: str = "canada") -> StructuredToolResult:
     """
     Query a datastore-backed resource SERVER-SIDE via CKAN datastore_search.
     No file download — the portal's database does the filtering. Use this for large
@@ -603,14 +1244,28 @@ def query_datastore(resource_id: str, q: str = "", filters: str = "",
         sort: Sort spec, e.g. "year desc" or "name asc".
         limit: Max rows to return (default 50, capped at 100).
         offset: Row offset for pagination (default 0).
+        source_id: CKAN source containing the resource: canada, alberta, or ontario.
 
     Returns:
         Markdown table of matching rows with a pagination hint.
     """
+    effective_limit = max(1, min(limit, MAX_RESULT_ROWS))
+    effective_offset = max(0, offset)
+    try:
+        source = get_source(source_id)
+        if source.source_type != "ckan":
+            raise ValueError("Datastore queries require a CKAN source.")
+    except ValueError as error:
+        return make_error_result(
+            str(error), code="InvalidSource",
+            query={"operation": "datastore_search", "source_id": source_id},
+            recovery="Use canada, alberta, or ontario; use query_remote_file for ordinary files.",
+        )
+    parsed_filters: Dict[str, Any] = {}
     params: Dict[str, Any] = {
         "resource_id": resource_id,
-        "limit": max(1, min(limit, MAX_RESULT_ROWS)),
-        "offset": max(0, offset),
+        "limit": effective_limit,
+        "offset": effective_offset,
     }
     if q:
         params["q"] = q
@@ -618,38 +1273,97 @@ def query_datastore(resource_id: str, q: str = "", filters: str = "",
         params["sort"] = sort
     if filters:
         try:
-            json.loads(filters)  # validate
+            parsed_filters = json.loads(filters)
+            if not isinstance(parsed_filters, dict):
+                raise ValueError("filters must be a JSON object")
             params["filters"] = filters
-        except json.JSONDecodeError:
-            return f"Error: `filters` must be valid JSON, e.g. '{{\"province\": \"Alberta\"}}'. Got: {filters}"
+        except (json.JSONDecodeError, ValueError):
+            return make_error_result(
+                "`filters` must be a valid JSON object, for example {\"province\": \"Alberta\"}.",
+                code="InvalidFilters",
+                query={
+                    "operation": "datastore_search",
+                    "resource_id": resource_id,
+                    "source_id": source_id,
+                    "q": q,
+                    "sort": sort,
+                    "limit": effective_limit,
+                    "offset": effective_offset,
+                },
+                recovery="Pass exact-match filters as a JSON object encoded as a string.",
+            )
+
+    query_info = {
+        "operation": "datastore_search",
+        "resource_id": resource_id,
+        "source_id": source_id,
+        "q": q,
+        "filters": parsed_filters,
+        "sort": sort,
+        "limit": effective_limit,
+        "offset": effective_offset,
+    }
 
     try:
-        result = _ckan_get("datastore_search", **params)
+        result = _ckan_get("datastore_search", source_id=source_id, **params)
     except Exception as e:
-        return (f"Error querying datastore '{resource_id}': {e}\n"
-                f"(If this resource isn't datastore-backed, use query_remote_file.)")
+        return make_error_result(
+            f"Could not query datastore '{resource_id}': {e}",
+            code="DatastoreQueryFailed",
+            query=query_info,
+            retryable=True,
+            recovery="If this resource is not datastore-backed, use query_remote_file with its download URL.",
+        )
 
     records = result.get("records", [])
-    if not records:
-        return f"Query ran, but no rows matched (total in resource: {result.get('total', '?')})."
-    df = _clean_df(pd.DataFrame(records))
 
     # Resolve the parent dataset URL for citation
     citation = ""
+    sources: List[SourceReference] = []
+    warnings: List[str] = []
     try:
-        res_info = _ckan_get("resource_show", id=resource_id)
+        res_info = _ckan_get("resource_show", source_id=source_id, id=resource_id)
         pkg_id = res_info.get("package_id", "")
         if pkg_id:
+            catalog_id = qualify_dataset_id(source_id, pkg_id)
+            page = source.page_url(pkg_id)
             citation = (f"\n\n---\n**Source**: "
-                        f"[open.canada.ca/data/en/dataset/{pkg_id}]"
-                        f"(https://open.canada.ca/data/en/dataset/{pkg_id})")
-    except Exception:
-        pass
+                        f"[{source.name}]({page})")
+            sources.append(SourceReference(
+                title=f"{source.name} dataset",
+                url=page,
+                dataset_id=catalog_id,
+                resource_id=resource_id,
+            ))
+    except Exception as e:
+        warnings.append(
+            f"The parent dataset citation could not be resolved ({type(e).__name__})."
+        )
 
-    return (f"### {result.get('total', len(records))} rows matched "
-            f"(showing {len(records)} from offset {offset})\n\n"
-            + _df_to_md(df, cap=limit, offset=offset, total=result.get("total"))
-            + citation)
+    if not records:
+        return make_tool_result(
+            f"Query ran, but no rows matched (total in resource: {result.get('total', '?')}).",
+            sources=sources,
+            query={**query_info, "total": result.get("total")},
+            warnings=[*warnings, "The query completed successfully but matched no rows."],
+        )
+
+    df = _clean_df(pd.DataFrame(records))
+    columns, structured_rows = _df_to_structured(df, cap=effective_limit)
+
+    markdown = (f"### {result.get('total', len(records))} rows matched "
+                f"(showing {len(records)} from offset {effective_offset})\n\n"
+                + _df_to_md(df, cap=effective_limit, offset=effective_offset,
+                            total=result.get("total"))
+                + citation)
+    return make_tool_result(
+        markdown,
+        columns=columns,
+        rows=structured_rows,
+        sources=sources,
+        query={**query_info, "total": result.get("total")},
+        warnings=warnings,
+    )
 
 
 # =====================================================================
@@ -817,9 +1531,9 @@ def query_excel_sheet(file_url: str, sheet_name: str, sql_query: str) -> str:
     return _df_to_md(_clean_df(out)) + citation
 
 
-@mcp.tool()
+@mcp.tool(structured_output=True)
 @log_telemetry("query_remote_file")
-def query_remote_file(file_url: str, sql_query: str) -> str:
+def query_remote_file(file_url: str, sql_query: str) -> StructuredToolResult:
     """
     Run a read-only DuckDB SQL query directly on a remote file (CSV/Parquet/JSON/ZIP).
     Use '{file}' as the table placeholder. For datastore-backed resources prefer
@@ -835,36 +1549,85 @@ def query_remote_file(file_url: str, sql_query: str) -> str:
         file_url: Direct resource download URL (CSV, Parquet, JSON, or ZIP of CSV).
         sql_query: SELECT query using '{file}' as the table reference.
     """
+    query_info = {
+        "operation": "remote_file_query",
+        "file_url": file_url,
+        "sql": sql_query,
+        "row_limit": MAX_RESULT_ROWS,
+    }
     if not file_url or not sql_query:
-        return "Error: both file_url and sql_query are required."
+        return make_error_result(
+            "Both file_url and sql_query are required.",
+            code="MissingArgument",
+            query=query_info,
+            recovery="Pass a direct CSV, Parquet, JSON, or ZIP URL and a SELECT query using {file}.",
+        )
 
-    if _WRITE_RE.search(sql_query):
-        return "Error: only read-only SELECT queries are permitted."
+    sql_error = _read_only_sql_error(sql_query)
+    if sql_error:
+        return make_error_result(
+            sql_error,
+            code="UnsafeOrInvalidSQL",
+            query=query_info,
+            recovery="Use one read-only SELECT query and refer to the input as '{file}'.",
+        )
 
     citation = f"\n\n---\n**Source**: [{file_url}]({file_url})"
+    sources = [SourceReference(title="Remote data resource", url=file_url)]
     low = file_url.lower()
+    warnings: List[str] = []
 
     # ZIP files must be downloaded and extracted first — DuckDB httpfs can't unzip
     if low.endswith(".zip"):
         try:
             df = _read_tabular(file_url)
         except Exception as e:
-            return f"Error reading ZIP file: {e}"
+            return make_error_result(
+                f"Could not read ZIP file: {e}",
+                code="RemoteFileReadFailed",
+                query=query_info,
+                retryable=True,
+                recovery="Verify that the URL is public and the ZIP contains a supported tabular file.",
+            )
         sql = sql_query.replace("'{file}'", "df").replace("{file}", "df")
         try:
             out = _query_dataframe(sql, df)
         except Exception as e:
-            return f"Error executing query on ZIP contents: {e}"
+            return make_error_result(
+                f"Could not execute the query on ZIP contents: {e}",
+                code="RemoteQueryFailed",
+                query=query_info,
+                recovery="Inspect the file schema and verify all column names in the SQL query.",
+            )
         if out.empty:
-            return "Query ran successfully but returned 0 rows."
-        return _df_to_md(_clean_df(out)) + citation
+            return make_tool_result(
+                "Query ran successfully but returned 0 rows." + citation,
+                sources=sources,
+                query=query_info,
+                warnings=["The query completed successfully but returned no rows."],
+            )
+        clean_out = _clean_df(out)
+        columns, rows = _df_to_structured(clean_out)
+        return make_tool_result(
+            _df_to_md(clean_out) + citation,
+            columns=columns,
+            rows=rows,
+            sources=sources,
+            query=query_info,
+        )
 
     # Standard DuckDB httpfs path for CSV / Parquet / JSON
     sql = sql_query.replace("'{file}'", f"'{file_url}'").replace("{file}", f"'{file_url}'")
     try:
         df = run_query_with_timeout(sql)
     except TimeoutError as e:
-        return str(e)
+        return make_error_result(
+            str(e),
+            code="QueryTimeout",
+            query=query_info,
+            retryable=True,
+            recovery="Add filters or a LIMIT, or use query_datastore when the resource is API-backed.",
+        )
     except Exception as e:
         # DuckDB httpfs uses its own HTTP stack (no User-Agent, no TLS 1.2
         # fallback) and gets reset by some government hosts that _robust_get
@@ -874,10 +1637,33 @@ def query_remote_file(file_url: str, sql_query: str) -> str:
             local_sql = sql_query.replace("'{file}'", "df").replace("{file}", "df")
             df = _query_dataframe(local_sql, df_local)
         except Exception as e2:
-            return f"Error executing query: {e}\n(Local download fallback also failed: {e2})"
+            return make_error_result(
+                f"Remote query failed ({e}); local-download fallback also failed ({e2}).",
+                code="RemoteQueryFailed",
+                query=query_info,
+                retryable=True,
+                recovery="Verify the URL and format, then call get_file_schema before retrying the query.",
+            )
+        warnings.append(
+            f"DuckDB HTTP streaming failed ({type(e).__name__}); the query succeeded using a local-download fallback."
+        )
     if df.empty:
-        return "Query ran successfully but returned 0 rows."
-    return _df_to_md(_clean_df(df)) + citation
+        return make_tool_result(
+            "Query ran successfully but returned 0 rows." + citation,
+            sources=sources,
+            query=query_info,
+            warnings=[*warnings, "The query completed successfully but returned no rows."],
+        )
+    clean_df = _clean_df(df)
+    columns, rows = _df_to_structured(clean_df)
+    return make_tool_result(
+        _df_to_md(clean_df) + citation,
+        columns=columns,
+        rows=rows,
+        sources=sources,
+        query=query_info,
+        warnings=warnings,
+    )
 
 
 @mcp.tool()
@@ -940,7 +1726,7 @@ def query_canada_data(question: str) -> str:
     Use this as your starting point for any Canada open data question.
     """
     return (
-        f"Answer this question using Government of Canada open data: {question!r}\n\n"
+        f"Answer this question using authoritative Canadian open data: {question!r}\n\n"
         "Follow this workflow exactly:\n"
         "1. Call `semantic_search_datasets(question)` to find the most relevant datasets.\n"
         "2. Pick the best match and call `get_dataset(id)` to see its resources.\n"
@@ -963,7 +1749,7 @@ def explore_dataset(topic: str) -> str:
     Good for 'what data exists on X?' questions.
     """
     return (
-        f"I want to explore what Government of Canada open data exists on: {topic!r}\n\n"
+        f"I want to explore what authoritative Canadian open data exists on: {topic!r}\n\n"
         "Please:\n"
         "1. Call `semantic_search_datasets(topic)` — show me the top results.\n"
         "2. For the most relevant dataset, call `get_dataset(id)` to list its resources.\n"
@@ -983,7 +1769,7 @@ def compare_datasets(topic: str) -> str:
     Find multiple datasets on a topic and compare their coverage, recency, and queryability.
     """
     return (
-        f"Find and compare Government of Canada open datasets related to: {topic!r}\n\n"
+        f"Find and compare authoritative Canadian open datasets related to: {topic!r}\n\n"
         "Steps:\n"
         "1. Call `semantic_search_datasets(topic, limit=6)` to get a broad set of results.\n"
         "2. Compare the datasets using a markdown table. Show title, publisher, format, queryability, and last modified date.\n"

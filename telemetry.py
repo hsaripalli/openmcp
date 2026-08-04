@@ -30,6 +30,8 @@ import re
 import inspect
 import requests
 
+from version import __version__
+
 logger = logging.getLogger("openmcp.telemetry")
 
 # Default public collector endpoint (Supabase REST, insert-only via RLS).
@@ -45,7 +47,7 @@ DEFAULT_TELEMETRY_KEY = (
 
 # Generate a single random session ID per server process run (non-identifiable)
 SESSION_ID = str(uuid.uuid4())
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = __version__
 
 # Background thread pool worker (max 2 threads, fast daemon)
 _executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="TelemetryWorker")
@@ -131,7 +133,9 @@ def _normalize_dataset_id(value: Any) -> Optional[str]:
     url_match = re.search(r"/dataset/([0-9a-z_-]{1,100})", text, re.IGNORECASE)
     if url_match:
         return url_match.group(1)
-    if re.fullmatch(r"[0-9a-z_-]{1,100}", text, re.IGNORECASE):
+    if re.fullmatch(r"[0-9a-z_-]{1,30}:[0-9a-z_-]{1,120}", text, re.IGNORECASE):
+        return text.lower()
+    if re.fullmatch(r"[0-9a-z_-]{1,120}", text, re.IGNORECASE):
         return text
     return None
 
@@ -153,11 +157,35 @@ def _normalize_dataset_ids(values: list[Any]) -> list[str]:
 
 def _dataset_ids_from_result(result: Any) -> list[str]:
     """Extract public dataset IDs from a tool result without retaining its text."""
-    if not isinstance(result, str):
+    if isinstance(result, str):
+        return _normalize_dataset_ids(
+            re.findall(r"/dataset/([0-9a-z_-]{1,100})", result, re.IGNORECASE)
+        )
+
+    structured = getattr(result, "structuredContent", None)
+    if not isinstance(structured, dict):
         return []
-    return _normalize_dataset_ids(
-        re.findall(r"/dataset/([0-9a-z_-]{1,100})", result, re.IGNORECASE)
-    )
+    candidates = []
+    for dataset in structured.get("datasets", []):
+        if isinstance(dataset, dict):
+            candidates.append(dataset.get("id"))
+    for source in structured.get("sources", []):
+        if isinstance(source, dict):
+            candidates.append(source.get("dataset_id"))
+    return _normalize_dataset_ids(candidates)
+
+
+def _structured_error_code(result: Any) -> Optional[str]:
+    """Return a stable code when a structured MCP tool result represents an error."""
+    structured = getattr(result, "structuredContent", None)
+    if not isinstance(structured, dict):
+        return None
+    error = structured.get("error")
+    if isinstance(error, dict) and error.get("code"):
+        return str(error["code"])[:100]
+    if getattr(result, "isError", False):
+        return "ToolReturnedError"
+    return None
 
 
 def _resource_key(value: Any) -> Optional[str]:
@@ -254,6 +282,11 @@ def log_telemetry(tool_name: str) -> Callable:
                     elif normalized_result.startswith("Query timed out"):
                         status = "error"
                         error_code = "TimeoutError"
+                else:
+                    structured_error_code = _structured_error_code(result)
+                    if structured_error_code:
+                        status = "error"
+                        error_code = structured_error_code
                 return result
             except Exception as ex:
                 status = "error"
